@@ -41,6 +41,10 @@ var (
 	denyQueriesOutsideRetention = flag.Bool("denyQueriesOutsideRetention", false, "Whether to deny queries outside of the configured -retentionPeriod. "+
 		"When set, then /api/v1/query_range would return '503 Service Unavailable' error for queries with 'from' value outside -retentionPeriod. "+
 		"This may be useful when multiple data sources with distinct retentions are hidden behind query-tee")
+	maxHourlySeries = flag.Int("storage.maxHourlySeries", 0, "The maximum number of unique series can be added to the storage during the last hour. "+
+		"Excess series are logged and dropped. This can be useful for limiting series cardinality. See also -storage.maxDailySeries")
+	maxDailySeries = flag.Int("storage.maxDailySeries", 0, "The maximum number of unique series can be added to the storage during the last 24 hours. "+
+		"Excess series are logged and dropped. This can be useful for limiting series churn rate. See also -storage.maxHourlySeries")
 )
 
 // CheckTimeRange returns true if the given tr is denied for querying.
@@ -81,7 +85,7 @@ func InitWithoutMetrics(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 	logger.Infof("opening storage at %q with -retentionPeriod=%s", *DataPath, retentionPeriod)
 	startTime := time.Now()
 	WG = syncwg.WaitGroup{}
-	strg, err := storage.OpenStorage(*DataPath, retentionPeriod.Msecs)
+	strg, err := storage.OpenStorage(*DataPath, retentionPeriod.Msecs, *maxHourlySeries, *maxDailySeries)
 	if err != nil {
 		logger.Fatalf("cannot open a storage at %s with -retentionPeriod=%s: %s", *DataPath, retentionPeriod, err)
 	}
@@ -575,6 +579,13 @@ func registerStorageMetrics() {
 		return float64(m().SlowMetricNameLoads)
 	})
 
+	metrics.NewGauge(`vm_hourly_series_limit_rows_dropped_total`, func() float64 {
+		return float64(m().HourlySeriesLimitRowsDropped)
+	})
+	metrics.NewGauge(`vm_daily_series_limit_rows_dropped_total`, func() float64 {
+		return float64(m().DailySeriesLimitRowsDropped)
+	})
+
 	metrics.NewGauge(`vm_timestamps_blocks_merged_total`, func() float64 {
 		return float64(m().TimestampsBlocksMerged)
 	})
@@ -641,7 +652,7 @@ func registerStorageMetrics() {
 		return float64(idbm().IndexBlocksCacheSize)
 	})
 	metrics.NewGauge(`vm_cache_entries{type="indexdb/tagFilters"}`, func() float64 {
-		return float64(idbm().TagCacheSize)
+		return float64(idbm().TagFiltersCacheSize)
 	})
 	metrics.NewGauge(`vm_cache_entries{type="indexdb/uselessTagFilters"}`, func() float64 {
 		return float64(idbm().UselessTagFiltersCacheSize)
@@ -684,7 +695,7 @@ func registerStorageMetrics() {
 		return float64(m().NextDayMetricIDCacheSizeBytes)
 	})
 	metrics.NewGauge(`vm_cache_size_bytes{type="indexdb/tagFilters"}`, func() float64 {
-		return float64(idbm().TagCacheSizeBytes)
+		return float64(idbm().TagFiltersCacheSizeBytes)
 	})
 	metrics.NewGauge(`vm_cache_size_bytes{type="indexdb/uselessTagFilters"}`, func() float64 {
 		return float64(idbm().UselessTagFiltersCacheSizeBytes)
@@ -715,7 +726,7 @@ func registerStorageMetrics() {
 		return float64(idbm().IndexBlocksCacheRequests)
 	})
 	metrics.NewGauge(`vm_cache_requests_total{type="indexdb/tagFilters"}`, func() float64 {
-		return float64(idbm().TagCacheRequests)
+		return float64(idbm().TagFiltersCacheRequests)
 	})
 	metrics.NewGauge(`vm_cache_requests_total{type="indexdb/uselessTagFilters"}`, func() float64 {
 		return float64(idbm().UselessTagFiltersCacheRequests)
@@ -746,7 +757,7 @@ func registerStorageMetrics() {
 		return float64(idbm().IndexBlocksCacheMisses)
 	})
 	metrics.NewGauge(`vm_cache_misses_total{type="indexdb/tagFilters"}`, func() float64 {
-		return float64(idbm().TagCacheMisses)
+		return float64(idbm().TagFiltersCacheMisses)
 	})
 	metrics.NewGauge(`vm_cache_misses_total{type="indexdb/uselessTagFilters"}`, func() float64 {
 		return float64(idbm().UselessTagFiltersCacheMisses)

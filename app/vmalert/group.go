@@ -18,14 +18,15 @@ import (
 
 // Group is an entity for grouping rules
 type Group struct {
-	mu          sync.RWMutex
-	Name        string
-	File        string
-	Rules       []Rule
-	Type        datasource.Type
-	Interval    time.Duration
-	Concurrency int
-	Checksum    string
+	mu                sync.RWMutex
+	Name              string
+	File              string
+	Rules             []Rule
+	Type              datasource.Type
+	Interval          time.Duration
+	Concurrency       int
+	Checksum          string
+	ExtraFilterLabels map[string]string
 
 	doneCh     chan struct{}
 	finishedCh chan struct{}
@@ -51,15 +52,17 @@ func newGroupMetrics(name, file string) *groupMetrics {
 
 func newGroup(cfg config.Group, qb datasource.QuerierBuilder, defaultInterval time.Duration, labels map[string]string) *Group {
 	g := &Group{
-		Type:        cfg.Type,
-		Name:        cfg.Name,
-		File:        cfg.File,
-		Interval:    cfg.Interval,
-		Concurrency: cfg.Concurrency,
-		Checksum:    cfg.Checksum,
-		doneCh:      make(chan struct{}),
-		finishedCh:  make(chan struct{}),
-		updateCh:    make(chan *Group),
+		Type:              cfg.Type,
+		Name:              cfg.Name,
+		File:              cfg.File,
+		Interval:          cfg.Interval.Duration(),
+		Concurrency:       cfg.Concurrency,
+		Checksum:          cfg.Checksum,
+		ExtraFilterLabels: cfg.ExtraFilterLabels,
+
+		doneCh:     make(chan struct{}),
+		finishedCh: make(chan struct{}),
+		updateCh:   make(chan *Group),
 	}
 	g.metrics = newGroupMetrics(g.Name, g.File)
 	if g.Interval == 0 {
@@ -115,6 +118,8 @@ func (g *Group) Restore(ctx context.Context, qb datasource.QuerierBuilder, lookb
 		if rr.For < 1 {
 			continue
 		}
+		// ignore g.ExtraFilterLabels on purpose, so it
+		// won't affect the restore procedure.
 		q := qb.BuildWithParams(datasource.QuerierParams{})
 		if err := rr.Restore(ctx, q, lookback, labels); err != nil {
 			return fmt.Errorf("error while restoring rule %q: %w", rule, err)
@@ -163,6 +168,7 @@ func (g *Group) updateWith(newGroup *Group) error {
 	}
 	g.Type = newGroup.Type
 	g.Concurrency = newGroup.Concurrency
+	g.ExtraFilterLabels = newGroup.ExtraFilterLabels
 	g.Checksum = newGroup.Checksum
 	g.Rules = newRules
 	return nil
@@ -263,15 +269,10 @@ type executor struct {
 
 func (e *executor) execConcurrently(ctx context.Context, rules []Rule, concurrency int, interval time.Duration) chan error {
 	res := make(chan error, len(rules))
-	var returnSeries bool
-	if e.rw != nil {
-		returnSeries = true
-	}
-
 	if concurrency == 1 {
 		// fast path
 		for _, rule := range rules {
-			res <- e.exec(ctx, rule, returnSeries, interval)
+			res <- e.exec(ctx, rule, interval)
 		}
 		close(res)
 		return res
@@ -284,7 +285,7 @@ func (e *executor) execConcurrently(ctx context.Context, rules []Rule, concurren
 			sem <- struct{}{}
 			wg.Add(1)
 			go func(r Rule) {
-				res <- e.exec(ctx, r, returnSeries, interval)
+				res <- e.exec(ctx, r, interval)
 				<-sem
 				wg.Done()
 			}(rule)
@@ -303,14 +304,14 @@ var (
 	remoteWriteErrors = metrics.NewCounter(`vmalert_remotewrite_errors_total`)
 )
 
-func (e *executor) exec(ctx context.Context, rule Rule, returnSeries bool, interval time.Duration) error {
+func (e *executor) exec(ctx context.Context, rule Rule, interval time.Duration) error {
 	execTotal.Inc()
 	execStart := time.Now()
 	defer func() {
 		execDuration.UpdateDuration(execStart)
 	}()
 
-	tss, err := rule.Exec(ctx, returnSeries)
+	tss, err := rule.Exec(ctx)
 	if err != nil {
 		execErrors.Inc()
 		return fmt.Errorf("rule %q: failed to execute: %w", rule, err)

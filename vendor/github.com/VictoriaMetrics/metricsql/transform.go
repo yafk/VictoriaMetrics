@@ -52,7 +52,7 @@ var transformFuncs = map[string]bool{
 	"label_match":        true,
 	"label_mismatch":     true,
 	"union":              true,
-	"":                   true, // empty func is a synonim to union
+	"":                   true, // empty func is a synonym to union
 	"keep_last_value":    true,
 	"keep_next_value":    true,
 	"interpolate":        true,
@@ -88,6 +88,7 @@ var transformFuncs = map[string]bool{
 	"histogram_stddev":   true,
 	"sort_by_label":      true,
 	"sort_by_label_desc": true,
+	"timezone_offset":    true,
 }
 
 // IsTransformFunc returns whether funcName is known transform function.

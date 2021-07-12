@@ -1,8 +1,8 @@
 # vmauth
 
-`vmauth` is a simple auth proxy and router for [VictoriaMetrics](https://github.com/VictoriaMetrics/VictoriaMetrics).
-It reads username and password from [Basic Auth headers](https://en.wikipedia.org/wiki/Basic_access_authentication),
-matches them against configs pointed by `-auth.config` command-line flag and proxies incoming HTTP requests to the configured per-user `url_prefix` on successful match.
+`vmauth` is a simple auth proxy, router and [load balancer](#load-balancing) for [VictoriaMetrics](https://github.com/VictoriaMetrics/VictoriaMetrics).
+It reads auth credentials from `Authorization` http header ([Basic Auth](https://en.wikipedia.org/wiki/Basic_access_authentication) and `Bearer token` is supported),
+matches them against configs pointed by [-auth.config](#auth-config) command-line flag and proxies incoming HTTP requests to the configured per-user `url_prefix` on successful match.
 
 
 ## Quick start
@@ -27,9 +27,14 @@ Feel free [contacting us](mailto:info@victoriametrics.com) if you need customize
 accounting and rate limiting such as [vmgateway](https://docs.victoriametrics.com/vmgateway.html).
 
 
+## Load balancing
+
+Each `url_prefix` in the [-auth.config](#auth-config) may contain either a single url or a list of urls. In the latter case `vmauth` balances load among the configured urls in a round-robin manner. This feature is useful for balancing the load among multiple `vmselect` and/or `vminsert` nodes in [VictoriaMetrics cluster](https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html).
+
+
 ## Auth config
 
-Auth config is represented in the following simple `yml` format:
+`-auth.config` is represented in the following simple `yml` format:
 
 ```yml
 
@@ -61,31 +66,47 @@ users:
   # The user for querying account 123 in VictoriaMetrics cluster
   # See https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html#url-format
   # All the requests to http://vmauth:8427 with the given Basic Auth (username:password)
-  # will be proxied to http://vmselect:8481/select/123/prometheus .
-  # For example, http://vmauth:8427/api/v1/query is proxied to http://vmselect:8481/select/123/prometheus/api/v1/select
+  # will be load-balanced among http://vmselect1:8481/select/123/prometheus and http://vmselect2:8481/select/123/prometheus
+  # For example, http://vmauth:8427/api/v1/query is proxied to the following urls in a round-robin manner:
+  #   - http://vmselect1:8481/select/123/prometheus/api/v1/select
+  #   - http://vmselect2:8481/select/123/prometheus/api/v1/select
 - username: "cluster-select-account-123"
   password: "***"
-  url_prefix: "http://vmselect:8481/select/123/prometheus"
+  url_prefix:
+  - "http://vmselect1:8481/select/123/prometheus"
+  - "http://vmselect2:8481/select/123/prometheus"
 
   # The user for inserting Prometheus data into VictoriaMetrics cluster under account 42
   # See https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html#url-format
   # All the requests to http://vmauth:8427 with the given Basic Auth (username:password)
-  # will be proxied to http://vminsert:8480/insert/42/prometheus .
-  # For example, http://vmauth:8427/api/v1/write is proxied to http://vminsert:8480/insert/42/prometheus/api/v1/write
+  # will be load-balanced between http://vminsert1:8480/insert/42/prometheus and http://vminsert2:8480/insert/42/prometheus
+  # For example, http://vmauth:8427/api/v1/write is proxied to the following urls in a round-robin manner:
+  #   - http://vminsert1:8480/insert/42/prometheus/api/v1/write
+  #   - http://vminsert2:8480/insert/42/prometheus/api/v1/write
 - username: "cluster-insert-account-42"
   password: "***"
-  url_prefix: "http://vminsert:8480/insert/42/prometheus"
+  url_prefix:
+  - "http://vminsert1:8480/insert/42/prometheus"
+  - "http://vminsert2:8480/insert/42/prometheus"
 
 
   # A single user for querying and inserting data:
   # - Requests to http://vmauth:8427/api/v1/query, http://vmauth:8427/api/v1/query_range
-  #   and http://vmauth:8427/api/v1/label/<label_name>/values are proxied to http://vmselect:8481/select/42/prometheus.
-  #   For example, http://vmauth:8427/api/v1/query is proxied to http://vmselect:8480/select/42/prometheus/api/v1/query
+  #   and http://vmauth:8427/api/v1/label/<label_name>/values are proxied to the following urls in a round-robin manner:
+  #     - http://vmselect1:8481/select/42/prometheus
+  #     - http://vmselect2:8481/select/42/prometheus
+  #   For example, http://vmauth:8427/api/v1/query is proxied to http://vmselect1:8480/select/42/prometheus/api/v1/query
+  #   or to http://vmselect2:8480/select/42/prometheus/api/v1/query .
   # - Requests to http://vmauth:8427/api/v1/write are proxied to http://vminsert:8480/insert/42/prometheus/api/v1/write
 - username: "foobar"
   url_map:
-  - src_paths: ["/api/v1/query", "/api/v1/query_range", "/api/v1/label/[^/]+/values"]
-    url_prefix: "http://vmselect:8481/select/42/prometheus"
+  - src_paths:
+    - "/api/v1/query"
+    - "/api/v1/query_range"
+    - "/api/v1/label/[^/]+/values"
+    url_prefix:
+    - "http://vmselect1:8481/select/42/prometheus"
+    - "http://vmselect2:8481/select/42/prometheus"
   - src_paths: ["/api/v1/write"]
     url_prefix: "http://vminsert:8480/insert/42/prometheus"
 ```
@@ -109,6 +130,8 @@ Do not transfer Basic Auth headers in plaintext over untrusted networks. Enable 
 
 Alternatively, [https termination proxy](https://en.wikipedia.org/wiki/TLS_termination_proxy) may be put in front of `vmauth`.
 
+It is recommended protecting `/-/reload` endpoint with `-reloadAuthKey` command-line flag, so external users couldn't trigger config reload.
+
 
 ## Monitoring
 
@@ -123,7 +146,7 @@ It is recommended using [binary releases](https://github.com/VictoriaMetrics/Vic
 
 ### Development build
 
-1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.15.
+1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.16.
 2. Run `make vmauth` from the root folder of [the repository](https://github.com/VictoriaMetrics/VictoriaMetrics).
    It builds `vmauth` binary and puts it into the `bin` folder.
 
@@ -200,7 +223,7 @@ See the docs at https://docs.victoriametrics.com/vmauth.html .
   -http.pathPrefix string
     	An optional prefix to add to all the paths handled by http server. For example, if '-http.pathPrefix=/foo/bar' is set, then all the http requests will be handled on '/foo/bar/*' paths. This may be useful for proxied requests. See https://www.robustperception.io/using-external-urls-and-proxies-with-prometheus
   -http.shutdownDelay duration
-    	Optional delay before http server shutdown. During this delay, the servier returns non-OK responses from /health page, so load balancers can route new requests to other servers
+    	Optional delay before http server shutdown. During this delay, the server returns non-OK responses from /health page, so load balancers can route new requests to other servers
   -httpAuth.password string
     	Password for HTTP Basic Auth. The authentication is disabled if -httpAuth.username is empty
   -httpAuth.username string
@@ -232,6 +255,8 @@ See the docs at https://docs.victoriametrics.com/vmauth.html .
     	Auth key for /metrics. It overrides httpAuth settings
   -pprofAuthKey string
     	Auth key for /debug/pprof. It overrides httpAuth settings
+  -reloadAuthKey string
+    	Auth key for /-/reload http endpoint. It must be passed as authKey=...
   -tls
     	Whether to enable TLS (aka HTTPS) for incoming requests. -tlsCertFile and -tlsKeyFile must be set if -tls is set
   -tlsCertFile string

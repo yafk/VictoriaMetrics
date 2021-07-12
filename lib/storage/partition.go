@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"math/bits"
 	"os"
 	"path/filepath"
 	"sort"
@@ -79,10 +78,10 @@ const finalPartsToMerge = 3
 // Higher number of shards reduces CPU contention and increases the max bandwidth on multi-core systems.
 var rawRowsShardsPerPartition = (cgroup.AvailableCPUs() + 7) / 8
 
-// getMaxRowsPerPartition returns the maximum number of rows that haven't been converted into parts yet.
-func getMaxRawRowsPerPartition() int {
+// getMaxRawRowsPerShard returns the maximum number of rows that haven't been converted into parts yet.
+func getMaxRawRowsPerShard() int {
 	maxRawRowsPerPartitionOnce.Do(func() {
-		n := memory.Allowed() / 256 / int(unsafe.Sizeof(rawRow{}))
+		n := memory.Allowed() / rawRowsShardsPerPartition / 256 / int(unsafe.Sizeof(rawRow{}))
 		if n < 1e4 {
 			n = 1e4
 		}
@@ -478,80 +477,48 @@ func (rrs *rawRowsShard) Len() int {
 }
 
 func (rrs *rawRowsShard) addRows(pt *partition, rows []rawRow) {
-	var rrss []*rawRows
+	var rowsToFlush []rawRow
 
 	rrs.mu.Lock()
 	if cap(rrs.rows) == 0 {
-		rrs.rows = getRawRowsMaxSize().rows
+		n := getMaxRawRowsPerShard()
+		rrs.rows = make([]rawRow, 0, n)
 	}
-	maxRowsCount := getMaxRawRowsPerPartition()
-	for {
-		capacity := maxRowsCount - len(rrs.rows)
-		if capacity >= len(rows) {
-			// Fast path - rows fit capacity.
-			rrs.rows = append(rrs.rows, rows...)
-			break
-		}
-
+	maxRowsCount := cap(rrs.rows)
+	capacity := maxRowsCount - len(rrs.rows)
+	if capacity >= len(rows) {
+		// Fast path - rows fit capacity.
+		rrs.rows = append(rrs.rows, rows...)
+	} else {
 		// Slow path - rows don't fit capacity.
-		// Fill rawRows to capacity and convert it to a part.
-		rrs.rows = append(rrs.rows, rows[:capacity]...)
-		rows = rows[capacity:]
-		rr := getRawRowsMaxSize()
-		rrs.rows, rr.rows = rr.rows, rrs.rows
-		rrss = append(rrss, rr)
+		// Put rrs.rows and rows to rowsToFlush and convert it to a part.
+		rowsToFlush = append(rowsToFlush, rrs.rows...)
+		rowsToFlush = append(rowsToFlush, rows...)
+		rrs.rows = rrs.rows[:0]
 		rrs.lastFlushTime = fasttime.UnixTimestamp()
 	}
 	rrs.mu.Unlock()
 
-	for _, rr := range rrss {
-		pt.addRowsPart(rr.rows)
-		putRawRows(rr)
-	}
+	pt.flushRowsToParts(rowsToFlush)
 }
 
-type rawRows struct {
-	rows []rawRow
-}
-
-func getRawRowsMaxSize() *rawRows {
-	size := getMaxRawRowsPerPartition()
-	return getRawRowsWithSize(size)
-}
-
-func getRawRowsWithSize(size int) *rawRows {
-	p, sizeRounded := getRawRowsPool(size)
-	v := p.Get()
-	if v == nil {
-		return &rawRows{
-			rows: make([]rawRow, 0, sizeRounded),
+func (pt *partition) flushRowsToParts(rows []rawRow) {
+	maxRows := getMaxRawRowsPerShard()
+	var wg sync.WaitGroup
+	for len(rows) > 0 {
+		n := maxRows
+		if n > len(rows) {
+			n = len(rows)
 		}
+		wg.Add(1)
+		go func(rowsPart []rawRow) {
+			defer wg.Done()
+			pt.addRowsPart(rowsPart)
+		}(rows[:n])
+		rows = rows[n:]
 	}
-	return v.(*rawRows)
+	wg.Wait()
 }
-
-func putRawRows(rr *rawRows) {
-	rr.rows = rr.rows[:0]
-	size := cap(rr.rows)
-	p, _ := getRawRowsPool(size)
-	p.Put(rr)
-}
-
-func getRawRowsPool(size int) (*sync.Pool, int) {
-	size--
-	if size < 0 {
-		size = 0
-	}
-	bucketIdx := 64 - bits.LeadingZeros64(uint64(size))
-	if bucketIdx >= len(rawRowsPools) {
-		bucketIdx = len(rawRowsPools) - 1
-	}
-	p := &rawRowsPools[bucketIdx]
-	sizeRounded := 1 << uint(bucketIdx)
-	return p, sizeRounded
-}
-
-var rawRowsPools [19]sync.Pool
 
 func (pt *partition) addRowsPart(rows []rawRow) {
 	if len(rows) == 0 {
@@ -749,19 +716,14 @@ func (pt *partition) flushRawRows(isFinal bool) {
 }
 
 func (rrss *rawRowsShards) flush(pt *partition, isFinal bool) {
-	var wg sync.WaitGroup
-	wg.Add(len(rrss.shards))
+	var rowsToFlush []rawRow
 	for i := range rrss.shards {
-		go func(rrs *rawRowsShard) {
-			rrs.flush(pt, isFinal)
-			wg.Done()
-		}(&rrss.shards[i])
+		rowsToFlush = rrss.shards[i].appendRawRowsToFlush(rowsToFlush, pt, isFinal)
 	}
-	wg.Wait()
+	pt.flushRowsToParts(rowsToFlush)
 }
 
-func (rrs *rawRowsShard) flush(pt *partition, isFinal bool) {
-	var rr *rawRows
+func (rrs *rawRowsShard) appendRawRowsToFlush(dst []rawRow, pt *partition, isFinal bool) []rawRow {
 	currentTime := fasttime.UnixTimestamp()
 	flushSeconds := int64(rawRowsFlushInterval.Seconds())
 	if flushSeconds <= 0 {
@@ -770,15 +732,12 @@ func (rrs *rawRowsShard) flush(pt *partition, isFinal bool) {
 
 	rrs.mu.Lock()
 	if isFinal || currentTime-rrs.lastFlushTime > uint64(flushSeconds) {
-		rr = getRawRowsMaxSize()
-		rrs.rows, rr.rows = rr.rows, rrs.rows
+		dst = append(dst, rrs.rows...)
+		rrs.rows = rrs.rows[:0]
 	}
 	rrs.mu.Unlock()
 
-	if rr != nil {
-		pt.addRowsPart(rr.rows)
-		putRawRows(rr)
-	}
+	return dst
 }
 
 func (pt *partition) startInmemoryPartsFlusher() {
@@ -1255,7 +1214,7 @@ func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}) erro
 	}
 
 	d := time.Since(startTime)
-	if d > 10*time.Second {
+	if d > 30*time.Second {
 		logger.Infof("merged %d rows across %d blocks in %.3f seconds at %d rows/sec to %q; sizeBytes: %d",
 			outRowsCount, outBlocksCount, d.Seconds(), int(float64(outRowsCount)/d.Seconds()), dstPartPath, newPSize)
 	}
@@ -1427,17 +1386,18 @@ func appendPartsToMerge(dst, src []*partWrapper, maxPartsToMerge int, maxRows ui
 
 	// Filter out too big parts.
 	// This should reduce N for O(N^2) algorithm below.
-	needFreeSpace := false
+	skippedBigParts := 0
 	maxInPartRows := maxRows / 2
 	tmp := make([]*partWrapper, 0, len(src))
 	for _, pw := range src {
 		if pw.p.ph.RowsCount > maxInPartRows {
-			needFreeSpace = true
+			skippedBigParts++
 			continue
 		}
 		tmp = append(tmp, pw)
 	}
 	src = tmp
+	needFreeSpace := skippedBigParts > 1
 
 	// Sort src parts by rows count and backwards timestamp.
 	// This should improve adjanced points' locality in the merged parts.
@@ -1450,13 +1410,13 @@ func appendPartsToMerge(dst, src []*partWrapper, maxPartsToMerge int, maxRows ui
 		return a.RowsCount < b.RowsCount
 	})
 
-	minSrcParts := (maxPartsToMerge + 1) / 2
+	maxSrcParts := maxPartsToMerge
+	if maxSrcParts > len(src) {
+		maxSrcParts = len(src)
+	}
+	minSrcParts := (maxSrcParts + 1) / 2
 	if minSrcParts < 2 {
 		minSrcParts = 2
-	}
-	maxSrcParts := maxPartsToMerge
-	if len(src) < maxSrcParts {
-		maxSrcParts = len(src)
 	}
 
 	// Exhaustive search for parts giving the lowest write amplification when merged.
@@ -1491,7 +1451,7 @@ func appendPartsToMerge(dst, src []*partWrapper, maxPartsToMerge int, maxRows ui
 	}
 	if maxM < minM {
 		// There is no sense in merging parts with too small m.
-		return dst, false
+		return dst, needFreeSpace
 	}
 	return append(dst, pws...), needFreeSpace
 }

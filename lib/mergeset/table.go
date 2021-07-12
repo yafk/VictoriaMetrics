@@ -96,7 +96,9 @@ type Table struct {
 
 	path string
 
-	flushCallback func()
+	flushCallback         func()
+	flushCallbackWorkerWG sync.WaitGroup
+	needFlushCallbackCall uint32
 
 	prepareBlock PrepareBlockCallback
 
@@ -177,7 +179,7 @@ func (ris *rawItemsShard) Len() int {
 
 func (ris *rawItemsShard) addItems(tb *Table, items [][]byte) error {
 	var err error
-	var blocksToMerge []*inmemoryBlock
+	var blocksToFlush []*inmemoryBlock
 
 	ris.mu.Lock()
 	ibs := ris.ibs
@@ -200,19 +202,16 @@ func (ris *rawItemsShard) addItems(tb *Table, items [][]byte) error {
 		}
 	}
 	if len(ibs) >= maxBlocksPerShard {
-		blocksToMerge = ibs
-		ris.ibs = make([]*inmemoryBlock, 0, maxBlocksPerShard)
+		blocksToFlush = append(blocksToFlush, ibs...)
+		for i := range ibs {
+			ibs[i] = nil
+		}
+		ris.ibs = ibs[:0]
 		ris.lastFlushTime = fasttime.UnixTimestamp()
 	}
 	ris.mu.Unlock()
 
-	if blocksToMerge == nil {
-		// Fast path.
-		return err
-	}
-
-	// Slow path: merge blocksToMerge.
-	tb.mergeRawItemsBlocks(blocksToMerge)
+	tb.mergeRawItemsBlocks(blocksToFlush, false)
 	return err
 }
 
@@ -302,6 +301,27 @@ func OpenTable(path string, flushCallback func(), prepareBlock PrepareBlockCallb
 		tb.convertersWG.Done()
 	}()
 
+	if flushCallback != nil {
+		tb.flushCallbackWorkerWG.Add(1)
+		go func() {
+			// call flushCallback once per 10 seconds in order to improve the effectiveness of caches,
+			// which are reset by the flushCallback.
+			tc := time.NewTicker(10 * time.Second)
+			for {
+				select {
+				case <-tb.stopCh:
+					tb.flushCallback()
+					tb.flushCallbackWorkerWG.Done()
+					return
+				case <-tc.C:
+					if atomic.CompareAndSwapUint32(&tb.needFlushCallbackCall, 1, 0) {
+						tb.flushCallback()
+					}
+				}
+			}
+		}()
+	}
+
 	return tb, nil
 }
 
@@ -349,6 +369,11 @@ func (tb *Table) MustClose() {
 		logger.Panicf("FATAL: cannot flush inmemory parts to files in %q: %s", tb.path, err)
 	}
 	logger.Infof("%d inmemory parts have been flushed to files in %.3f seconds on %q", len(pws), time.Since(startTime).Seconds(), tb.path)
+
+	logger.Infof("waiting for flush callback worker to stop on %q...", tb.path)
+	startTime = time.Now()
+	tb.flushCallbackWorkerWG.Wait()
+	logger.Infof("flush callback worker stopped in %.3f seconds on %q", time.Since(startTime).Seconds(), tb.path)
 
 	// Remove references to parts from the tb, so they may be eventually closed
 	// after all the searches are done.
@@ -586,64 +611,75 @@ func (riss *rawItemsShards) flush(tb *Table, isFinal bool) {
 	tb.rawItemsPendingFlushesWG.Add(1)
 	defer tb.rawItemsPendingFlushesWG.Done()
 
-	var wg sync.WaitGroup
-	wg.Add(len(riss.shards))
+	var blocksToFlush []*inmemoryBlock
 	for i := range riss.shards {
-		go func(ris *rawItemsShard) {
-			ris.flush(tb, isFinal)
-			wg.Done()
-		}(&riss.shards[i])
+		blocksToFlush = riss.shards[i].appendBlocksToFlush(blocksToFlush, tb, isFinal)
 	}
-	wg.Wait()
+	tb.mergeRawItemsBlocks(blocksToFlush, isFinal)
 }
 
-func (ris *rawItemsShard) flush(tb *Table, isFinal bool) {
-	mustFlush := false
+func (ris *rawItemsShard) appendBlocksToFlush(dst []*inmemoryBlock, tb *Table, isFinal bool) []*inmemoryBlock {
 	currentTime := fasttime.UnixTimestamp()
 	flushSeconds := int64(rawItemsFlushInterval.Seconds())
 	if flushSeconds <= 0 {
 		flushSeconds = 1
 	}
-	var blocksToMerge []*inmemoryBlock
 
 	ris.mu.Lock()
 	if isFinal || currentTime-ris.lastFlushTime > uint64(flushSeconds) {
-		mustFlush = true
-		blocksToMerge = ris.ibs
-		ris.ibs = make([]*inmemoryBlock, 0, maxBlocksPerShard)
+		ibs := ris.ibs
+		dst = append(dst, ibs...)
+		for i := range ibs {
+			ibs[i] = nil
+		}
+		ris.ibs = ibs[:0]
 		ris.lastFlushTime = currentTime
 	}
 	ris.mu.Unlock()
 
-	if mustFlush {
-		tb.mergeRawItemsBlocks(blocksToMerge)
-	}
+	return dst
 }
 
-func (tb *Table) mergeRawItemsBlocks(blocksToMerge []*inmemoryBlock) {
+func (tb *Table) mergeRawItemsBlocks(ibs []*inmemoryBlock, isFinal bool) {
+	if len(ibs) == 0 {
+		return
+	}
 	tb.partMergersWG.Add(1)
 	defer tb.partMergersWG.Done()
 
-	pws := make([]*partWrapper, 0, (len(blocksToMerge)+defaultPartsToMerge-1)/defaultPartsToMerge)
-	for len(blocksToMerge) > 0 {
+	pws := make([]*partWrapper, 0, (len(ibs)+defaultPartsToMerge-1)/defaultPartsToMerge)
+	var pwsLock sync.Mutex
+	var wg sync.WaitGroup
+	for len(ibs) > 0 {
 		n := defaultPartsToMerge
-		if n > len(blocksToMerge) {
-			n = len(blocksToMerge)
+		if n > len(ibs) {
+			n = len(ibs)
 		}
-		pw := tb.mergeInmemoryBlocks(blocksToMerge[:n])
-		blocksToMerge = blocksToMerge[n:]
-		if pw == nil {
-			continue
-		}
-		pw.isInMerge = true
-		pws = append(pws, pw)
+		wg.Add(1)
+		go func(ibsPart []*inmemoryBlock) {
+			defer wg.Done()
+			pw := tb.mergeInmemoryBlocks(ibsPart)
+			if pw == nil {
+				return
+			}
+			pw.isInMerge = true
+			pwsLock.Lock()
+			pws = append(pws, pw)
+			pwsLock.Unlock()
+		}(ibs[:n])
+		ibs = ibs[n:]
 	}
+	wg.Wait()
 	if len(pws) > 0 {
 		if err := tb.mergeParts(pws, nil, true); err != nil {
 			logger.Panicf("FATAL: cannot merge raw parts: %s", err)
 		}
 		if tb.flushCallback != nil {
-			tb.flushCallback()
+			if isFinal {
+				tb.flushCallback()
+			} else {
+				atomic.CompareAndSwapUint32(&tb.needFlushCallbackCall, 0, 1)
+			}
 		}
 	}
 
@@ -672,10 +708,10 @@ func (tb *Table) mergeRawItemsBlocks(blocksToMerge []*inmemoryBlock) {
 	}
 }
 
-func (tb *Table) mergeInmemoryBlocks(blocksToMerge []*inmemoryBlock) *partWrapper {
-	// Convert blocksToMerge into inmemoryPart's
-	mps := make([]*inmemoryPart, 0, len(blocksToMerge))
-	for _, ib := range blocksToMerge {
+func (tb *Table) mergeInmemoryBlocks(ibs []*inmemoryBlock) *partWrapper {
+	// Convert ibs into inmemoryPart's
+	mps := make([]*inmemoryPart, 0, len(ibs))
+	for _, ib := range ibs {
 		if len(ib.items) == 0 {
 			continue
 		}
@@ -965,7 +1001,7 @@ func (tb *Table) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isOuterP
 	}
 
 	d := time.Since(startTime)
-	if d > 10*time.Second {
+	if d > 30*time.Second {
 		logger.Infof("merged %d items across %d blocks in %.3f seconds at %d items/sec to %q; sizeBytes: %d",
 			outItemsCount, outBlocksCount, d.Seconds(), int(float64(outItemsCount)/d.Seconds()), dstPartPath, newPSize)
 	}
@@ -1388,13 +1424,13 @@ func appendPartsToMerge(dst, src []*partWrapper, maxPartsToMerge int, maxItems u
 	// Sort src parts by itemsCount.
 	sort.Slice(src, func(i, j int) bool { return src[i].p.ph.itemsCount < src[j].p.ph.itemsCount })
 
-	minSrcParts := (maxPartsToMerge + 1) / 2
+	maxSrcParts := maxPartsToMerge
+	if maxSrcParts > len(src) {
+		maxSrcParts = len(src)
+	}
+	minSrcParts := (maxSrcParts + 1) / 2
 	if minSrcParts < 2 {
 		minSrcParts = 2
-	}
-	maxSrcParts := maxPartsToMerge
-	if len(src) < maxSrcParts {
-		maxSrcParts = len(src)
 	}
 
 	// Exhaustive search for parts giving the lowest write amplification when merged.

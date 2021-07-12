@@ -44,7 +44,7 @@ var (
 
 	disableResponseCompression  = flag.Bool("http.disableResponseCompression", false, "Disable compression of HTTP responses to save CPU resources. By default compression is enabled to save network bandwidth")
 	maxGracefulShutdownDuration = flag.Duration("http.maxGracefulShutdownDuration", 7*time.Second, `The maximum duration for a graceful shutdown of the HTTP server. A highly loaded server may require increased value for a graceful shutdown`)
-	shutdownDelay               = flag.Duration("http.shutdownDelay", 0, `Optional delay before http server shutdown. During this delay, the servier returns non-OK responses from /health page, so load balancers can route new requests to other servers`)
+	shutdownDelay               = flag.Duration("http.shutdownDelay", 0, `Optional delay before http server shutdown. During this delay, the server returns non-OK responses from /health page, so load balancers can route new requests to other servers`)
 	idleConnTimeout             = flag.Duration("http.idleConnTimeout", time.Minute, "Timeout for incoming idle http connections")
 	connTimeout                 = flag.Duration("http.connTimeout", 2*time.Minute, `Incoming http connections are closed after the configured timeout. This may help to spread the incoming load among a cluster of services behind a load balancer. Please note that the real timeout may be bigger by up to 10% as a protection against the thundering herd problem`)
 )
@@ -157,7 +157,10 @@ func Stop(addr string) error {
 	delete(servers, addr)
 	serversLock.Unlock()
 	if s == nil {
-		logger.Panicf("BUG: there is no http server at %q", addr)
+		err := fmt.Errorf("BUG: there is no http server at %q", addr)
+		logger.Panicf("%s", err)
+		// The return is needed for golangci-lint: SA5011(related information): this check suggests that the pointer can be nil
+		return err
 	}
 
 	deadline := time.Now().Add(*shutdownDelay).UnixNano()
@@ -566,7 +569,8 @@ func GetQuotedRemoteAddr(r *http.Request) string {
 func Errorf(w http.ResponseWriter, r *http.Request, format string, args ...interface{}) {
 	errStr := fmt.Sprintf(format, args...)
 	remoteAddr := GetQuotedRemoteAddr(r)
-	errStr = fmt.Sprintf("remoteAddr: %s; %s", remoteAddr, errStr)
+	requestURI := GetRequestURI(r)
+	errStr = fmt.Sprintf("remoteAddr: %s; requestURI: %s; %s", remoteAddr, requestURI, errStr)
 	logger.WarnfSkipframes(1, "%s", errStr)
 
 	// Extract statusCode from args
@@ -626,4 +630,22 @@ func WriteAPIHelp(w io.Writer, pathList [][2]string) {
 		p = path.Join(*pathPrefix, p)
 		fmt.Fprintf(w, "<a href=%q>%s</a> - %s<br/>", p, p, doc)
 	}
+}
+
+// GetRequestURI returns requestURI for r.
+func GetRequestURI(r *http.Request) string {
+	requestURI := r.RequestURI
+	if r.Method != "POST" {
+		return requestURI
+	}
+	_ = r.ParseForm()
+	queryArgs := r.PostForm.Encode()
+	if len(queryArgs) == 0 {
+		return requestURI
+	}
+	delimiter := "?"
+	if strings.Contains(requestURI, delimiter) {
+		delimiter = "&"
+	}
+	return requestURI + delimiter + queryArgs
 }

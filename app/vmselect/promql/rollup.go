@@ -517,7 +517,7 @@ func (rc *rollupConfig) doInternal(dstValues []float64, tsm *timeseriesMap, valu
 	if window <= 0 {
 		window = rc.Step
 		if rc.CanDropLastSample && rc.LookbackDelta > 0 && window > rc.LookbackDelta {
-			// Implicitly window exceeds -search.maxStalenessInterval, so limit it to -search.maxStalenessInterval
+			// Implicit window exceeds -search.maxStalenessInterval, so limit it to -search.maxStalenessInterval
 			// according to https://github.com/VictoriaMetrics/VictoriaMetrics/issues/784
 			window = rc.LookbackDelta
 		}
@@ -1149,7 +1149,8 @@ func rollupTmin(rfa *rollupFuncArg) float64 {
 	minValue := values[0]
 	minTimestamp := timestamps[0]
 	for i, v := range values {
-		if v < minValue {
+		// Get the last timestamp for the minimum value as most users expect.
+		if v <= minValue {
 			minValue = v
 			minTimestamp = timestamps[i]
 		}
@@ -1168,7 +1169,8 @@ func rollupTmax(rfa *rollupFuncArg) float64 {
 	maxValue := values[0]
 	maxTimestamp := timestamps[0]
 	for i, v := range values {
-		if v > maxValue {
+		// Get the last timestamp for the maximum value as most users expect.
+		if v >= maxValue {
 			maxValue = v
 			maxTimestamp = timestamps[i]
 		}
@@ -1332,7 +1334,8 @@ func rollupIncreasePure(rfa *rollupFuncArg) float64 {
 	// There is no need in handling NaNs here, since they must be cleaned up
 	// before calling rollup funcs.
 	values := rfa.values
-	prevValue := rfa.prevValue
+	// restore to the real value because of potential staleness reset
+	prevValue := rfa.realPrevValue
 	if math.IsNaN(prevValue) {
 		if len(values) == 0 {
 			return nan

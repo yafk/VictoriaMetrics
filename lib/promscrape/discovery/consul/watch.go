@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,10 +43,13 @@ type serviceWatcher struct {
 }
 
 // newConsulWatcher creates new watcher and start background service discovery for Consul.
-func newConsulWatcher(client *discoveryutils.Client, sdc *SDConfig, datacenter string) *consulWatcher {
+func newConsulWatcher(client *discoveryutils.Client, sdc *SDConfig, datacenter, namespace string) *consulWatcher {
 	baseQueryArgs := "?dc=" + url.QueryEscape(datacenter)
 	if sdc.AllowStale {
 		baseQueryArgs += "&stale"
+	}
+	if namespace != "" {
+		baseQueryArgs += "&ns=" + namespace
 	}
 	for k, v := range sdc.NodeMeta {
 		baseQueryArgs += "&node-meta=" + url.QueryEscape(k+":"+v)
@@ -249,7 +253,8 @@ func shouldCollectServiceByName(filterServices []string, serviceName string) boo
 		return true
 	}
 	for _, filterService := range filterServices {
-		if filterService == serviceName {
+		// Use case-insensitive comparison for service names according to https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1422
+		if strings.EqualFold(filterService, serviceName) {
 			return true
 		}
 	}

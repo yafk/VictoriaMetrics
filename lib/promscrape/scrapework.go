@@ -305,6 +305,8 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 		wc.resetNoRows()
 		up = 0
 		scrapesSkippedBySampleLimit.Inc()
+		err = fmt.Errorf("the response from %q exceeds sample_limit=%d; "+
+			"either reduce the sample count for the target or increase sample_limit", sw.Config.ScrapeURL, sw.Config.SampleLimit)
 	}
 	sw.updateSeriesAdded(wc)
 	seriesAdded := sw.finalizeSeriesAdded(samplesPostRelabeling)
@@ -322,7 +324,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 	// body must be released only after wc is released, since wc refers to body.
 	sw.prevBodyLen = len(body.B)
 	leveledbytebufferpool.Put(body)
-	tsmGlobal.Update(sw.Config, sw.ScrapeGroup, up == 1, realTimestamp, int64(duration*1000), err)
+	tsmGlobal.Update(sw.Config, sw.ScrapeGroup, up == 1, realTimestamp, int64(duration*1000), samplesScraped, err)
 	return err
 }
 
@@ -348,6 +350,12 @@ func (sw *scrapeWork) scrapeStream(scrapeTimestamp, realTimestamp int64) error {
 			// after returning from the callback - this will result in data race.
 			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/825#issuecomment-723198247
 			samplesPostRelabeling += len(wc.writeRequest.Timeseries)
+			if sw.Config.SampleLimit > 0 && samplesPostRelabeling > sw.Config.SampleLimit {
+				wc.resetNoRows()
+				scrapesSkippedBySampleLimit.Inc()
+				return fmt.Errorf("the response from %q exceeds sample_limit=%d; "+
+					"either reduce the sample count for the target or increase sample_limit", sw.Config.ScrapeURL, sw.Config.SampleLimit)
+			}
 			sw.updateSeriesAdded(wc)
 			startTime := time.Now()
 			sw.PushData(&wc.writeRequest)
@@ -383,7 +391,7 @@ func (sw *scrapeWork) scrapeStream(scrapeTimestamp, realTimestamp int64) error {
 	sw.prevLabelsLen = len(wc.labels)
 	wc.reset()
 	writeRequestCtxPool.Put(wc)
-	tsmGlobal.Update(sw.Config, sw.ScrapeGroup, up == 1, realTimestamp, int64(duration*1000), err)
+	tsmGlobal.Update(sw.Config, sw.ScrapeGroup, up == 1, realTimestamp, int64(duration*1000), samplesScraped, err)
 	return err
 }
 

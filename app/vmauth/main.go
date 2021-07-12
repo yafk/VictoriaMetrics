@@ -20,6 +20,7 @@ import (
 var (
 	httpListenAddr         = flag.String("httpListenAddr", ":8427", "TCP address to listen for http connections")
 	maxIdleConnsPerBackend = flag.Int("maxIdleConnsPerBackend", 100, "The maximum number of idle connections vmauth can open per each backend host")
+	reloadAuthKey          = flag.String("reloadAuthKey", "", "Auth key for /-/reload http endpoint. It must be passed as authKey=...")
 )
 
 func main() {
@@ -51,6 +52,11 @@ func main() {
 func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 	switch r.URL.Path {
 	case "/-/reload":
+		authKey := r.FormValue("authKey")
+		if authKey != *reloadAuthKey {
+			httpserver.Errorf(w, r, "invalid authKey %q. It must match the value from -reloadAuthKey command line flag", authKey)
+			return true
+		}
 		configReloadRequests.Inc()
 		procutil.SelfSIGHUP()
 		w.WriteHeader(http.StatusOK)
@@ -75,8 +81,22 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	r.Header.Set("vm-target-url", targetURL.String())
-	reverseProxy.ServeHTTP(w, r)
+	proxyRequest(w, r)
 	return true
+}
+
+func proxyRequest(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		err := recover()
+		if err == nil || err == http.ErrAbortHandler {
+			// Suppress http.ErrAbortHandler panic.
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1353
+			return
+		}
+		// Forward other panics to the caller.
+		panic(err)
+	}()
+	reverseProxy.ServeHTTP(w, r)
 }
 
 var configReloadRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/-/reload"}`)

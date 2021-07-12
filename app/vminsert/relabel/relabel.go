@@ -14,11 +14,20 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 )
 
-var relabelConfig = flag.String("relabelConfig", "", "Optional path to a file with relabeling rules, which are applied to all the ingested metrics. "+
-	"See https://docs.victoriametrics.com/#relabeling for details")
+var (
+	relabelConfig = flag.String("relabelConfig", "", "Optional path to a file with relabeling rules, which are applied to all the ingested metrics. "+
+		"See https://docs.victoriametrics.com/#relabeling for details")
+	relabelDebug = flag.Bool("relabelDebug", false, "Whether to log metrics before and after relabeling with -relabelConfig. If the -relabelDebug is enabled, "+
+		"then the metrics aren't sent to storage. This is useful for debugging the relabeling configs")
+)
 
 // Init must be called after flag.Parse and before using the relabel package.
 func Init() {
+	// Register SIGHUP handler for config re-read just before loadRelabelConfig call.
+	// This guarantees that the config will be re-read if the signal arrives during loadRelabelConfig call.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1240
+	sighupCh := procutil.NewSighupChan()
+
 	pcs, err := loadRelabelConfig()
 	if err != nil {
 		logger.Fatalf("cannot load relabelConfig: %s", err)
@@ -27,7 +36,6 @@ func Init() {
 	if len(*relabelConfig) == 0 {
 		return
 	}
-	sighupCh := procutil.NewSighupChan()
 	go func() {
 		for range sighupCh {
 			logger.Infof("received SIGHUP; reloading -relabelConfig=%q...", *relabelConfig)
@@ -48,7 +56,7 @@ func loadRelabelConfig() (*promrelabel.ParsedConfigs, error) {
 	if len(*relabelConfig) == 0 {
 		return nil, nil
 	}
-	pcs, err := promrelabel.LoadRelabelConfigs(*relabelConfig)
+	pcs, err := promrelabel.LoadRelabelConfigs(*relabelConfig, *relabelDebug)
 	if err != nil {
 		return nil, fmt.Errorf("error when reading -relabelConfig=%q: %w", *relabelConfig, err)
 	}

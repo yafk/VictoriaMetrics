@@ -34,7 +34,9 @@ to `vmagent` such as the ability to push metrics instead of pulling them. We did
   are buffered at `-remoteWrite.tmpDataPath`. The buffered metrics are sent to remote storage as soon as the connection
   to the remote storage is repaired. The maximum disk usage for the buffer can be limited with `-remoteWrite.maxDiskUsagePerURL`.
 * Uses lower amounts of RAM, CPU, disk IO and network bandwidth compared with Prometheus.
-* Scrape targets can be spread among multiple `vmagent` instances when big number of targets must be scraped. See [these docs](#scraping-big-number-of-targets) for details.
+* Scrape targets can be spread among multiple `vmagent` instances when big number of targets must be scraped. See [these docs](#scraping-big-number-of-targets).
+* Can efficiently scrape targets that expose millions of time series such as [/federate endpoint in Prometheus](https://prometheus.io/docs/prometheus/latest/federation/). See [these docs](#stream-parsing-mode).
+* Can deal with high cardinality and high churn rate issues by limiting the number of unique time series sent to remote storage systems. See [these docs](#cardinality-limiter).
 
 
 ## Quick Start
@@ -171,10 +173,16 @@ The following scrape types in [scrape_config](https://prometheus.io/docs/prometh
 * `openstack_sd_configs` - is for scraping OpenStack targets.
   See [openstack_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#openstack_sd_config) for details.
   [OpenStack identity API v3](https://docs.openstack.org/api-ref/identity/v3/) is supported only.
+* `docker_sd_configs` - is for scraping Docker targets.
+  See [docker_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#docker_sd_config) for details.
 * `dockerswarm_sd_configs` - is for scraping Docker Swarm targets.
   See [dockerswarm_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#dockerswarm_sd_config) for details.
 * `eureka_sd_configs` - is for scraping targets registered in [Netflix Eureka](https://github.com/Netflix/eureka).
   See [eureka_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#eureka_sd_config) for details.
+* `digitalocean_sd_configs` is for scraping targerts registered in [DigitalOcean](https://www.digitalocean.com/)
+  See [digitalocean_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#digitalocean_sd_config) for details.
+* `http_sd_configs` is for scraping targerts registered in http service discovery.
+  See [http_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#http_sd_config) for details.
 
 Please file feature requests to [our issue tracker](https://github.com/VictoriaMetrics/VictoriaMetrics/issues) if you need other service discovery mechanisms to be supported by `vmagent`.
 
@@ -217,10 +225,10 @@ and also provides the following actions:
 
 The relabeling can be defined in the following places:
 
-* At the `scrape_config -> relabel_configs` section in `-promscrape.config` file. This relabeling is applied to target labels.
-* At the `scrape_config -> metric_relabel_configs` section in `-promscrape.config` file. This relabeling is applied to all the scraped metrics in the given `scrape_config`.
-* At the `-remoteWrite.relabelConfig` file. This relabeling is aplied to all the collected metrics before sending them to remote storage.
-* At the `-remoteWrite.urlRelabelConfig` files. This relabeling is applied to metrics before sending them to the corresponding `-remoteWrite.url`.
+* At the `scrape_config -> relabel_configs` section in `-promscrape.config` file. This relabeling is applied to target labels. This relabeling can be debugged by passing `relabel_debug: true` option to the corresponding `scrape_config` section. In this case `vmagent` logs target labels before and after the relabeling and then drops the logged target.
+* At the `scrape_config -> metric_relabel_configs` section in `-promscrape.config` file. This relabeling is applied to all the scraped metrics in the given `scrape_config`. This relabeling can be debugged by passing `metric_relabel_debug: true` option to the corresponding `scrape_config` section. In this case `vmagent` logs metrics before and after the relabeling and then drops the logged metrics.
+* At the `-remoteWrite.relabelConfig` file. This relabeling is aplied to all the collected metrics before sending them to remote storage. This relabeling can be debugged by passing `-remoteWrite.relabelDebug` command-line option to `vmagent`. In this case `vmagent` logs metrics before and after the relabeling and then drops all the logged metrics instead of sending them to remote storage.
+* At the `-remoteWrite.urlRelabelConfig` files. This relabeling is applied to metrics before sending them to the corresponding `-remoteWrite.url`. This relabeling can be debugged by passing `-remoteWrite.urlRelabelDebug` command-line options to `vmagent`. In this case `vmagent` logs metrics before and after the relabeling and then drops all the logged metrics instead of sending them to the corresponding `-remoteWrite.url`.
 
 You can read more about relabeling in the following articles:
 
@@ -250,13 +258,13 @@ By default `vmagent` reads the full response from scrape target into memory, the
       'match[]': ['{__name__!=""}']
   ```
 
-Note that `sample_limit` option doesn't work if stream parsing is enabled because the parsed data is pushed to remote storage as soon as it is parsed. Therefore the `sample_limit` option doesn't make sense during stream parsing.
+Note that `sample_limit` option doesn't prevent from data push to remote storage if stream parsing is enabled because the parsed data is pushed to remote storage as soon as it is parsed.
 
 
 ## Scraping big number of targets
 
 A single `vmagent` instance can scrape tens of thousands of scrape targets. Sometimes this isn't enough due to limitations on CPU, network, RAM, etc.
-In this case scrape targets can be split among multiple `vmagent` instances (aka `vmagent` horizontal scaling and clustering).
+In this case scrape targets can be split among multiple `vmagent` instances (aka `vmagent` horizontal scaling, sharding and clustering).
 Each `vmagent` instance in the cluster must use identical `-promscrape.config` files with distinct `-promscrape.cluster.memberNum` values.
 The flag value must be in the range `0 ... N-1`, where `N` is the number of `vmagent` instances in the cluster.
 The number of `vmagent` instances in the cluster must be passed to `-promscrape.cluster.membersCount` command-line flag. For example, the following commands
@@ -316,6 +324,22 @@ scrape_configs:
     server_name: real-server-name
 ```
 
+## Cardinality limiter
+
+By default `vmagent` doesn't limit the number of time series written to remote storage systems specified at `-remoteWrite.url`. The limit can be enforced by setting the following command-line flags:
+
+* `-remoteWrite.maxHourlySeries` - limits the number of unique time series `vmagent` can write to remote storage systems during the last hour. Useful for limiting the number of active time series.
+* `-remoteWrite.maxDailySeries` - limits the number of unique time series `vmagent` can write to remote storage systems during the last day. Useful for limiting daily churn rate.
+
+Both limits can be set simultaneously. If any of these limits is reached, then samples for new time series are dropped instead of sending them to remote storage systems. A sample of dropped series is put in the log with `WARNING` level.
+
+The exceeded limits can be [monitored](#monitoring) with the following metrics:
+
+* `vmagent_hourly_series_limit_rows_dropped_total` - the number of metrics dropped due to exceeded hourly limit on the number of unique time series.
+* `vmagent_daily_series_limit_rows_dropped_total` - the number of metrics dropped due to exceeded daily limit on the number of unique time series.
+
+These limits are approximate, so `vmagent` can underflow/overflow the limit by a small percentage (usually less than 1%).
+
 
 ## Monitoring
 
@@ -342,6 +366,12 @@ It may be useful to perform `vmagent` rolling update without any scrape loss.
 
 * We recommend you increase the maximum number of open files in the system (`ulimit -n`) when scraping a big number of targets,
   as `vmagent` establishes at least a single TCP connection per target.
+
+* If `vmagent` uses too big amounts of memory, then the following options can help:
+  * Enabling stream parsing. See [these docs](#stream-parsing-mode).
+  * Reducing the number of output queues with `-remoteWrite.queues` command-line option.
+  * Reducing the amounts of RAM vmagent can use for in-memory buffering with `-memory.allowedPercent` or `-memory.allowedBytes` command-line option. Another option is to reduce memory limits in Docker and/or Kuberntes if `vmagent` runs under these systems.
+  * Reducing the number of CPU cores vmagent can use by passing `GOMAXPROCS=N` environment variable to `vmagent`, where `N` is the desired limit on CPU cores. Another option is to reduce CPU limits in Docker or Kubernetes if `vmagent` runs under these systems.
 
 * When `vmagent` scrapes many unreliable targets, it can flood the error log with scrape errors. These errors can be suppressed
   by passing `-promscrape.suppressScrapeErrors` command-line flag to `vmagent`. The most recent scrape error per each target can be observed at `http://vmagent-host:8429/targets`
@@ -419,7 +449,7 @@ We recommend using [binary releases](https://github.com/VictoriaMetrics/Victoria
 
 ### Development build
 
-1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.15.
+1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.16.
 2. Run `make vmagent` from the root folder of [the repository](https://github.com/VictoriaMetrics/VictoriaMetrics).
    It builds the `vmagent` binary and puts it into the `bin` folder.
 
@@ -448,7 +478,7 @@ ARM build may run on Raspberry Pi or on [energy-efficient ARM servers](https://b
 
 ### Development ARM build
 
-1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.15.
+1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.16.
 2. Run `make vmagent-arm` or `make vmagent-arm64` from the root folder of [the repository](https://github.com/VictoriaMetrics/VictoriaMetrics)
    It builds `vmagent-arm` or `vmagent-arm64` binary respectively and puts it into the `bin` folder.
 
@@ -518,7 +548,7 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
   -http.pathPrefix string
     	An optional prefix to add to all the paths handled by http server. For example, if '-http.pathPrefix=/foo/bar' is set, then all the http requests will be handled on '/foo/bar/*' paths. This may be useful for proxied requests. See https://www.robustperception.io/using-external-urls-and-proxies-with-prometheus
   -http.shutdownDelay duration
-    	Optional delay before http server shutdown. During this delay, the servier returns non-OK responses from /health page, so load balancers can route new requests to other servers
+    	Optional delay before http server shutdown. During this delay, the server returns non-OK responses from /health page, so load balancers can route new requests to other servers
   -httpAuth.password string
     	Password for HTTP Basic Auth. The authentication is disabled if -httpAuth.username is empty
   -httpAuth.username string
@@ -603,6 +633,8 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
     	Wait time used by Consul service discovery. Default value is used if not set
   -promscrape.consulSDCheckInterval duration
     	Interval for checking for changes in Consul. This works only if consul_sd_configs is configured in '-promscrape.config' file. See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#consul_sd_config for details (default 30s)
+  -promscrape.digitaloceanSDCheckInterval duration
+        Interval for checking for changes in digital ocean. This works only if digitalocean_sd_configs is configured in '-promscrape.config' file. See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#digitalocean_sd_config for details (default 1m0s)    	
   -promscrape.disableCompression
     	Whether to disable sending 'Accept-Encoding: gzip' request headers to all the scrape targets. This may reduce CPU usage on scrape targets at the cost of higher network bandwidth utilization. It is possible to set 'disable_compression: true' individually per each 'scrape_config' section in '-promscrape.config' for fine grained control
   -promscrape.disableKeepAlive
@@ -625,6 +657,8 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
     	Interval for checking for changes in 'file_sd_config'. See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#file_sd_config for details (default 30s)
   -promscrape.gceSDCheckInterval duration
     	Interval for checking for changes in gce. This works only if gce_sd_configs is configured in '-promscrape.config' file. See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#gce_sd_config for details (default 1m0s)
+  -promscrape.httpSDCheckInterval duration
+        Interval for checking for changes in http service discovery. This works only if http_sd_configs is configured in '-promscrape.config' file. See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#http_sd_config for details (default 1m0s)    	   	
   -promscrape.kubernetes.apiServerTimeout duration
     	How frequently to reload the full state from Kuberntes API server (default 30m0s)
   -promscrape.kubernetesSDCheckInterval duration
@@ -645,11 +679,17 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
   -remoteWrite.basicAuth.password array
     	Optional basic auth password to use for -remoteWrite.url. If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url
     	Supports an array of values separated by comma or specified via multiple flags.
+  -remoteWrite.basicAuth.passwordFile array
+    	Optional path to basic auth password to use for -remoteWrite.url. The file is re-read every second. If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url
+    	Supports an array of values separated by comma or specified via multiple flags.
   -remoteWrite.basicAuth.username array
     	Optional basic auth username to use for -remoteWrite.url. If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url
     	Supports an array of values separated by comma or specified via multiple flags.
   -remoteWrite.bearerToken array
     	Optional bearer auth token to use for -remoteWrite.url. If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url
+    	Supports an array of values separated by comma or specified via multiple flags.
+  -remoteWrite.bearerTokenFile array
+    	Optional path to bearer token file to use for -remoteWrite.url. The token is re-read from the file every second. If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url
     	Supports an array of values separated by comma or specified via multiple flags.
   -remoteWrite.flushInterval duration
     	Interval for flushing the data to remote storage. This option takes effect only when less than 10K data points per second are pushed to -remoteWrite.url (default 1s)
@@ -659,19 +699,40 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
   -remoteWrite.maxBlockSize size
     	The maximum size in bytes of unpacked request to send to remote storage. It shouldn't exceed -maxInsertRequestSize from VictoriaMetrics
     	Supports the following optional suffixes for size values: KB, MB, GB, KiB, MiB, GiB (default 8388608)
+  -remoteWrite.maxDailySeries int
+    	The maximum number of unique series vmagent can send to remote storage systems during the last 24 hours. Excess series are logged and dropped. This can be useful for limiting series churn rate. See also -remoteWrite.maxHourlySeries
   -remoteWrite.maxDiskUsagePerURL size
     	The maximum file-based buffer size in bytes at -remoteWrite.tmpDataPath for each -remoteWrite.url. When buffer size reaches the configured maximum, then old data is dropped when adding new data to the buffer. Buffered data is stored in ~500MB chunks, so the minimum practical value for this flag is 500000000. Disk usage is unlimited if the value is set to 0
     	Supports the following optional suffixes for size values: KB, MB, GB, KiB, MiB, GiB (default 0)
+  -remoteWrite.maxHourlySeries int
+    	The maximum number of unique series vmagent can send to remote storage systems during the last hour. Excess series are logged and dropped. This can be useful for limiting series cardinality. See also -remoteWrite.maxDailySeries
+  -remoteWrite.oauth2.clientID array
+    	Optional OAuth2 clientID to use for -remoteWrite.url. If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url
+    	Supports an array of values separated by comma or specified via multiple flags.
+  -remoteWrite.oauth2.clientSecret array
+    	Optional OAuth2 clientSecret to use for -remoteWrite.url. If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url
+    	Supports an array of values separated by comma or specified via multiple flags.
+  -remoteWrite.oauth2.clientSecretFile array
+    	Optional OAuth2 clientSecretFile to use for -remoteWrite.url. If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url
+    	Supports an array of values separated by comma or specified via multiple flags.
+  -remoteWrite.oauth2.scopes array
+    	Optional OAuth2 scopes to use for -remoteWrite.url. Scopes must be delimited by ';'. If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url
+    	Supports an array of values separated by comma or specified via multiple flags.
+  -remoteWrite.oauth2.tokenUrl array
+    	Optional OAuth2 tokenURL to use for -remoteWrite.url. If multiple args are set, then they are applied independently for the corresponding -remoteWrite.url
+    	Supports an array of values separated by comma or specified via multiple flags.
   -remoteWrite.proxyURL array
     	Optional proxy URL for writing data to -remoteWrite.url. Supported proxies: http, https, socks5. Example: -remoteWrite.proxyURL=socks5://proxy:1234
     	Supports an array of values separated by comma or specified via multiple flags.
   -remoteWrite.queues int
-    	The number of concurrent queues to each -remoteWrite.url. Set more queues if default number of queues isn't enough for sending high volume of collected data to remote storage (default 4)
+    	The number of concurrent queues to each -remoteWrite.url. Set more queues if default number of queues isn't enough for sending high volume of collected data to remote storage (default 2 * numberOfAvailableCPUs)
   -remoteWrite.rateLimit array
     	Optional rate limit in bytes per second for data sent to -remoteWrite.url. By default the rate limit is disabled. It can be useful for limiting load on remote storage when big amounts of buffered data is sent after temporary unavailability of the remote storage
     	Supports array of values separated by comma or specified via multiple flags.
   -remoteWrite.relabelConfig string
     	Optional path to file with relabel_config entries. These entries are applied to all the metrics before sending them to -remoteWrite.url. See https://docs.victoriametrics.com/vmagent.html#relabeling for details
+  -remoteWrite.relabelDebug
+    	Whether to log metrics before and after relabeling with -remoteWrite.relabelConfig. If the -remoteWrite.relabelDebug is enabled, then the metrics aren't sent to remote storage. This is useful for debugging the relabeling configs
   -remoteWrite.roundDigits array
     	Round metric values to this number of decimal digits after the point before writing them to remote storage. Examples: -remoteWrite.roundDigits=2 would round 1.236 to 1.24, while -remoteWrite.roundDigits=-1 would round 126.78 to 130. By default digits rounding is disabled. Set it to 100 for disabling it for a particular remote storage. This option may be used for improving data compression for the stored metrics
     	Supports array of values separated by comma or specified via multiple flags.
@@ -706,6 +767,9 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
   -remoteWrite.urlRelabelConfig array
     	Optional path to relabel config for the corresponding -remoteWrite.url
     	Supports an array of values separated by comma or specified via multiple flags.
+  -remoteWrite.urlRelabelDebug array
+    	Whether to log metrics before and after relabeling with -remoteWrite.urlRelabelConfig. If the -remoteWrite.urlRelabelDebug is enabled, then the metrics aren't sent to the corresponding -remoteWrite.url. This is useful for debugging the relabeling configs
+    	Supports array of values separated by comma or specified via multiple flags.
   -sortLabels
     	Whether to sort labels for incoming samples before writing them to all the configured remote storage systems. This may be needed for reducing memory usage at remote storage when the order of labels in incoming samples is random. For example, if m{k1="v1",k2="v2"} may be sent as m{k2="v2",k1="v1"}Enabled sorting for labels can slow down ingestion performance a bit
   -tls

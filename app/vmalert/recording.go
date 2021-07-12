@@ -66,6 +66,7 @@ func newRecordingRule(qb datasource.QuerierBuilder, group *Group, cfg config.Rul
 		q: qb.BuildWithParams(datasource.QuerierParams{
 			DataSourceType:     &cfg.Type,
 			EvaluationInterval: group.Interval,
+			ExtraLabels:        group.ExtraFilterLabels,
 		}),
 	}
 
@@ -87,12 +88,30 @@ func (rr *RecordingRule) Close() {
 	metrics.UnregisterMetric(rr.metrics.errors.name)
 }
 
-// Exec executes RecordingRule expression via the given Querier.
-func (rr *RecordingRule) Exec(ctx context.Context, series bool) ([]prompbmarshal.TimeSeries, error) {
-	if !series {
-		return nil, nil
+// ExecRange executes recording rule on the given time range similarly to Exec.
+// It doesn't update internal states of the Rule and meant to be used just
+// to get time series for backfilling.
+func (rr *RecordingRule) ExecRange(ctx context.Context, start, end time.Time) ([]prompbmarshal.TimeSeries, error) {
+	series, err := rr.q.QueryRange(ctx, rr.Expr, start, end)
+	if err != nil {
+		return nil, err
 	}
+	duplicates := make(map[string]struct{}, len(series))
+	var tss []prompbmarshal.TimeSeries
+	for _, s := range series {
+		ts := rr.toTimeSeries(s)
+		key := stringifyLabels(ts)
+		if _, ok := duplicates[key]; ok {
+			return nil, fmt.Errorf("original metric %v; resulting labels %q: %w", s.Labels, key, errDuplicate)
+		}
+		duplicates[key] = struct{}{}
+		tss = append(tss, ts)
+	}
+	return tss, nil
+}
 
+// Exec executes RecordingRule expression via the given Querier.
+func (rr *RecordingRule) Exec(ctx context.Context) ([]prompbmarshal.TimeSeries, error) {
 	qMetrics, err := rr.q.Query(ctx, rr.Expr)
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
@@ -106,7 +125,7 @@ func (rr *RecordingRule) Exec(ctx context.Context, series bool) ([]prompbmarshal
 	duplicates := make(map[string]struct{}, len(qMetrics))
 	var tss []prompbmarshal.TimeSeries
 	for _, r := range qMetrics {
-		ts := rr.toTimeSeries(r, time.Unix(r.Timestamp, 0))
+		ts := rr.toTimeSeries(r)
 		key := stringifyLabels(ts)
 		if _, ok := duplicates[key]; ok {
 			rr.lastExecError = errDuplicate
@@ -137,7 +156,7 @@ func stringifyLabels(ts prompbmarshal.TimeSeries) string {
 	return b.String()
 }
 
-func (rr *RecordingRule) toTimeSeries(m datasource.Metric, timestamp time.Time) prompbmarshal.TimeSeries {
+func (rr *RecordingRule) toTimeSeries(m datasource.Metric) prompbmarshal.TimeSeries {
 	labels := make(map[string]string)
 	for _, l := range m.Labels {
 		labels[l.Name] = l.Value
@@ -147,12 +166,10 @@ func (rr *RecordingRule) toTimeSeries(m datasource.Metric, timestamp time.Time) 
 	for k, v := range rr.Labels {
 		labels[k] = v
 	}
-	return newTimeSeries(m.Value, labels, timestamp)
+	return newTimeSeries(m.Values, m.Timestamps, labels)
 }
 
 // UpdateWith copies all significant fields.
-// alerts state isn't copied since
-// it should be updated in next 2 Execs
 func (rr *RecordingRule) UpdateWith(r Rule) error {
 	nr, ok := r.(*RecordingRule)
 	if !ok {
@@ -160,6 +177,7 @@ func (rr *RecordingRule) UpdateWith(r Rule) error {
 	}
 	rr.Expr = nr.Expr
 	rr.Labels = nr.Labels
+	rr.q = nr.q
 	return nil
 }
 
